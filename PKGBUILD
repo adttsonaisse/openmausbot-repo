@@ -20,7 +20,7 @@ depends=(
 )
 options=('!strip' '!debug')
 noextract=("OpenMausBot-${pkgver}-amd64.deb")
-source=("OpenMausBot-${pkgver}-amd64.deb::https://github.com/milind-soni/OpenMausBot/releases/download/v${pkgver}/OpenMausBot-${pkgver}-amd64.deb")
+source=("OpenMausBot-0.1.176-amd64.deb::https://github.com/milind-soni/OpenMausBot/releases/download/v0.1.176/OpenMausBot-0.1.176-amd64.deb")
 sha256sums=('d3688c8ce0fa5b1ed914e85fd4560206f156f13f241ff5d00de4918886399db8')
 
 _deb="OpenMausBot-${pkgver}-amd64.deb"
