@@ -1,0 +1,13 @@
+# Hasil makepkg
+src/
+pkg/
+*.pkg.tar.*
+*.deb
+
+# Hasil workflow build
+dist/
+repo/
+.build.sh
+.build-user.sh
+latest.json
+upstream.deb

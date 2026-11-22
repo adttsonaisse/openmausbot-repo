@@ -1,0 +1,213 @@
+name: Build & publish openmausbot-repo
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openmausbot-repo
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: milind-soni/OpenMausBot
+  REPO_NAME: openmausbot-repo
+  RELEASE_TAG: repo
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Cek versi rilis upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${UPSTREAM}/releases/latest" > latest.json
+
+          tag=$(jq -r '.tag_name' latest.json)
+          deb=$(jq -r '[.assets[].name | select(test("^OpenMausBot-.*-amd64[.]deb$"))] | first // empty' latest.json)
+          if [[ -z "$deb" ]]; then
+            echo "::error::Tidak ada asset *-amd64.deb di rilis ${tag}"
+            exit 1
+          fi
+
+          version=$(printf '%s' "$deb" | sed -E 's/^OpenMausBot-(.*)-amd64\.deb$/\1/')
+          url="https://github.com/${UPSTREAM}/releases/download/${tag}/${deb}"
+
+          # GitHub menyediakan digest sha256 pada asset rilis. Kalau tidak ada,
+          # unduh file untuk dihash manual.
+          digest=$(jq -r --arg n "$deb" '.assets[] | select(.name == $n) | .digest // empty' latest.json)
+          if [[ -n "$digest" ]]; then
+            sha="${digest#sha256:}"
+          else
+            echo 'digest tidak tersedia, mengunduh .deb untuk dihash'
+            curl -fsSL --retry 3 -o upstream.deb "$url"
+            sha=$(sha256sum upstream.deb | awk '{print $1}')
+          fi
+
+          current=$(sed -n 's/^pkgver=//p' PKGBUILD | head -n1)
+
+          # Self-healing: kalau PKGBUILD sudah versi terbaru tetapi asset belum
+          # pernah terbit di release "repo", tetap lanjut build.
+          published=false
+          if assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+            if printf '%s\n' "$assets" | grep -q "^openmausbot-bin-${current}-"; then
+              published=true
+            fi
+          fi
+
+          {
+            echo "version=${version}"
+            echo "url=${url}"
+            echo "sha=${sha}"
+            echo "current=${current}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$version" == "$current" && "$published" == "true" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Sudah up todate (${version}) dan paket sudah terbit. Skip."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Perlu build: PKGBUILD=${current}, upstream=${version}, published=${published}"
+          fi
+
+      - name: Update PKGBUILD (pkgver, source, sha256sums, pkgrel)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          URL: ${{ steps.check.outputs.url }}
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s|^source=(.*|source=(\"OpenMausBot-${VERSION}-amd64.deb::${URL}\")|" PKGBUILD
+          sed -i "s/^sha256sums=(.*/sha256sums=('${SHA}')/" PKGBUILD
+
+          grep -E '^(pkgver|pkgrel|source|sha256sums)=' PKGBUILD
+
+      - name: Build di container archlinux:base-devel (user non-root) + repo-add
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          # Script yang jalan sebagai root di container: siapkan user non-root.
+          cat > .build.sh <<'ROOT_SCRIPT'
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed ca-certificates fakeroot
+          getent group "$HOST_GID" >/dev/null || groupadd -g "$HOST_GID" builder
+          id builder >/dev/null 2>&1 || useradd -m -u "$HOST_UID" -g "$HOST_GID" builder
+          chown -R "$HOST_UID:$HOST_GID" /work
+          su builder -s /bin/bash -c 'export HOME=/home/builder; bash /work/.build-user.sh'
+          ROOT_SCRIPT
+
+          # Script makepkg + repo-add. UID builder disamakan dengan user runner
+          # supaya hasil build bisa dibaca/di-upload dari host.
+          cat > .build-user.sh <<'USER_SCRIPT'
+          set -euo pipefail
+          cd /work
+
+          makepkg --noconfirm --clean
+
+          mkdir -p repo
+          mv ./*.pkg.tar.zst repo/
+          cd repo
+
+          # Membuat <repo>.db.tar.gz dan <repo>.files.tar.gz sekaligus
+          repo-add "$REPO_NAME.db.tar.gz" ./*.pkg.tar.zst
+
+          # GitHub Releases tidak menyimpan symlink. Timpa symlink .db dan
+          # .files dengan salinan isi file .tar.gz masing-masing.
+          for link in "$REPO_NAME.db" "$REPO_NAME.files"; do
+            if [ -L "$link" ]; then
+              cp -L "$link" "$link.tmp"
+              mv -f "$link.tmp" "$link"
+            fi
+          done
+
+          cp -L ./*.pkg.tar.zst ../dist/
+          cp -L "$REPO_NAME.db" "$REPO_NAME.db.tar.gz" \
+                "$REPO_NAME.files" "$REPO_NAME.files.tar.gz" ../dist/
+          USER_SCRIPT
+
+          chmod +x .build.sh .build-user.sh
+
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            -e REPO_NAME="$REPO_NAME" \
+            archlinux:base-devel \
+            bash /work/.build.sh
+
+          sudo chown -R "$(id -u):$(id -g)" dist repo 2>/dev/null || true
+          ls -l dist
+
+      - name: Commit PKGBUILD ke branch main
+        if: steps.check.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PKGBUILD
+
+          if git diff --cached --quiet; then
+            echo 'PKGBUILD tidak berubah, tidak ada commit.'
+          else
+            git commit -m "chore: bump openmausbot-bin to ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload ke release "repo" (tag tetap)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --target main \
+              --notes "Database dan paket pacman untuk ${REPO_NAME}. Tag ini sengaja tetap agar URL di pacman.conf tidak berubah."
+          fi
+
+          # Nama paket mengandung versi, jadi asset lama tidak akan tertimpa
+          # oleh --clobber. Hapus dulu paket versi lama dari release ini.
+          old_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
+            | grep -E '\.pkg\.tar\.zst$' || true)
+          if [[ -n "$old_assets" ]]; then
+            while IFS= read -r asset; do
+              echo "Menghapus asset lama: ${asset}"
+              gh release delete-asset "$RELEASE_TAG" "$asset" -y
+            done <<< "$old_assets"
+          fi
+
+          # Nama database (.db, .files, .tar.gz) sama setiap build -> ditimpa.
+          gh release upload "$RELEASE_TAG" \
+            dist/*.pkg.tar.zst \
+            "dist/${REPO_NAME}.db" \
+            "dist/${REPO_NAME}.db.tar.gz" \
+            "dist/${REPO_NAME}.files" \
+            "dist/${REPO_NAME}.files.tar.gz" \
+            --clobber
+
+          echo "Selesai. https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
