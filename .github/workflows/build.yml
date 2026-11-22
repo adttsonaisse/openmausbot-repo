@@ -121,7 +121,9 @@ jobs:
           set -euo pipefail
           cd /work
 
-          makepkg --noconfirm --clean
+          # --nodeps: dependency runtime tidak perlu terpasang saat build,
+          # karena paket ini hanya membongkar biner .deb yang sudah jadi.
+          makepkg --noconfirm --clean --nodeps
 
           mkdir -p repo
           mv ./*.pkg.tar.zst repo/
