@@ -7,7 +7,9 @@ pkg/
 # Hasil workflow build
 dist/
 repo/
+existing-db/
 .build.sh
 .build-user.sh
+.build_targets
 latest.json
 upstream.deb

@@ -2,7 +2,7 @@ name: Build & publish openmausbot-repo
 
 on:
   schedule:
-    - cron: '17 6 * * *'
+    - cron: '17 */4 * * *'
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  UPSTREAM: milind-soni/OpenMausBot
   REPO_NAME: openmausbot-repo
   RELEASE_TAG: repo
 
@@ -26,84 +25,116 @@ jobs:
         with:
           ref: main
 
-      - name: Cek versi rilis upstream
+      - name: Cek semua paket & update PKGBUILD jika ada rilis baru
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          gh api "repos/${UPSTREAM}/releases/latest" > latest.json
+          : > .build_targets
+          mkdir -p existing-db
 
-          tag=$(jq -r '.tag_name' latest.json)
-          deb=$(jq -r '[.assets[].name | select(test("^OpenMausBot-.*-amd64[.]deb$"))] | first // empty' latest.json)
-          if [[ -z "$deb" ]]; then
-            echo "::error::Tidak ada asset *-amd64.deb di rilis ${tag}"
-            exit 1
-          fi
-
-          version=$(printf '%s' "$deb" | sed -E 's/^OpenMausBot-(.*)-amd64\.deb$/\1/')
-          url="https://github.com/${UPSTREAM}/releases/download/${tag}/${deb}"
-
-          # GitHub menyediakan digest sha256 pada asset rilis. Kalau tidak ada,
-          # unduh file untuk dihash manual.
-          digest=$(jq -r --arg n "$deb" '.assets[] | select(.name == $n) | .digest // empty' latest.json)
-          if [[ -n "$digest" ]]; then
-            sha="${digest#sha256:}"
-          else
-            echo 'digest tidak tersedia, mengunduh .deb untuk dihash'
-            curl -fsSL --retry 3 -o upstream.deb "$url"
-            sha=$(sha256sum upstream.deb | awk '{print $1}')
-          fi
-
-          current=$(sed -n 's/^pkgver=//p' PKGBUILD | head -n1)
-
-          # Self-healing: kalau PKGBUILD sudah versi terbaru tetapi asset belum
-          # pernah terbit di release "repo", tetap lanjut build.
-          published=false
-          if assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
-            if printf '%s\n' "$assets" | grep -q "^openmausbot-bin-${current}-"; then
-              published=true
+          release_assets=""
+          db_entries=""
+          if release_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+            if printf '%s\n' "$release_assets" | grep -qx "${REPO_NAME}.db.tar.gz"; then
+              gh release download "$RELEASE_TAG" -p "${REPO_NAME}.db.tar.gz" -D existing-db --clobber
+              db_entries=$(tar -tzf "existing-db/${REPO_NAME}.db.tar.gz")
             fi
           fi
 
-          {
-            echo "version=${version}"
-            echo "url=${url}"
-            echo "sha=${sha}"
-            echo "current=${current}"
-          } >> "$GITHUB_OUTPUT"
+          while IFS= read -r pkg_json; do
+            pkgname=$(jq -r '.pkgname' <<< "$pkg_json")
+            dir=$(jq -r '.dir' <<< "$pkg_json")
+            upstream=$(jq -r '.upstream' <<< "$pkg_json")
+            asset_regex=$(jq -r '.asset_regex' <<< "$pkg_json")
+            version_sed=$(jq -r '.version_sed' <<< "$pkg_json")
+            deb_template=$(jq -r '.deb_name_template' <<< "$pkg_json")
 
-          if [[ "$version" == "$current" && "$published" == "true" ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Sudah up todate (${version}) dan paket sudah terbit. Skip."
-          else
+            echo "=== Mengecek ${pkgname} (${upstream}) ==="
+            gh api "repos/${upstream}/releases/latest" > latest.json
+
+            tag=$(jq -r '.tag_name' latest.json)
+            deb=$(jq -r --arg re "$asset_regex" '[.assets[].name | select(test($re))] | first // empty' latest.json)
+            if [[ -z "$deb" ]]; then
+              echo "::error::Tidak ada asset cocok (${asset_regex}) di rilis ${upstream}@${tag}"
+              exit 1
+            fi
+
+            version=$(printf '%s' "$deb" | sed -E "$version_sed")
+            url="https://github.com/${upstream}/releases/download/${tag}/${deb}"
+
+            # GitHub menyediakan digest sha256 pada asset rilis. Kalau tidak ada,
+            # unduh file untuk dihash manual.
+            digest=$(jq -r --arg n "$deb" '.assets[] | select(.name == $n) | .digest // empty' latest.json)
+            if [[ -n "$digest" ]]; then
+              sha="${digest#sha256:}"
+            else
+              echo "digest tidak tersedia untuk ${deb}, mengunduh untuk dihash"
+              curl -fsSL --retry 3 -o upstream.deb "$url"
+              sha=$(sha256sum upstream.deb | awk '{print $1}')
+              rm -f upstream.deb
+            fi
+
+            pkgbuild="${dir}/PKGBUILD"
+            current=$(sed -n 's/^pkgver=//p' "$pkgbuild" | head -n1)
+
+            # Self-healing: pastikan asset .pkg.tar.zst dan entri di .db.tar.gz
+            # sama-sama sudah ada untuk versi PKGBUILD saat ini.
+            published=false
+            if printf '%s\n' "$release_assets" | grep -qE "^${pkgname}-${current}-[0-9]+-.*\.pkg\.tar\.zst$" \
+               && printf '%s\n' "$db_entries" | grep -qE "^${pkgname}-${current}-[0-9]+/desc$"; then
+              published=true
+            fi
+
+            if [[ "$version" == "$current" && "$published" == "true" ]]; then
+              echo "${pkgname}: sudah up to date (${version}) dan paket sudah terbit. Skip."
+              continue
+            fi
+
+            echo "${pkgname}: perlu build (PKGBUILD=${current}, upstream=${version}, published=${published})"
+
+            deb_name="${deb_template//\{version\}/$version}"
+            sed -i "s/^pkgver=.*/pkgver=${version}/" "$pkgbuild"
+            sed -i "s/^pkgrel=.*/pkgrel=1/" "$pkgbuild"
+            sed -i "s|^source=(.*|source=(\"${deb_name}::${url}\")|" "$pkgbuild"
+            sed -i "s/^sha256sums=(.*/sha256sums=('${sha}')/" "$pkgbuild"
+
+            grep -E '^(pkgver|pkgrel|source|sha256sums)=' "$pkgbuild"
+            printf '%s|%s|%s\n' "$dir" "$pkgname" "$version" >> .build_targets
+          done < <(jq -c '.[]' packages.json)
+
+          if [[ -s .build_targets ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Perlu build: PKGBUILD=${current}, upstream=${version}, published=${published}"
+            echo "Daftar paket yang akan di-build:"
+            cat .build_targets
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Semua paket sudah up to date. Tidak ada yang perlu di-build."
           fi
-
-      - name: Update PKGBUILD (pkgver, source, sha256sums, pkgrel)
-        if: steps.check.outputs.changed == 'true'
-        env:
-          VERSION: ${{ steps.check.outputs.version }}
-          URL: ${{ steps.check.outputs.url }}
-          SHA: ${{ steps.check.outputs.sha }}
-        run: |
-          set -euo pipefail
-
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s|^source=(.*|source=(\"OpenMausBot-${VERSION}-amd64.deb::${URL}\")|" PKGBUILD
-          sed -i "s/^sha256sums=(.*/sha256sums=('${SHA}')/" PKGBUILD
-
-          grep -E '^(pkgver|pkgrel|source|sha256sums)=' PKGBUILD
 
       - name: Build di container archlinux:base-devel (user non-root) + repo-add
         if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          mkdir -p dist
+          mkdir -p dist repo
+
+          # Ambil database repo yang sudah ada supaya paket yang tidak di-rebuild
+          # tetap ada di .db dan .files.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+            if printf '%s\n' "$assets" | grep -qx "${REPO_NAME}.db.tar.gz" \
+               && printf '%s\n' "$assets" | grep -qx "${REPO_NAME}.files.tar.gz"; then
+              gh release download "$RELEASE_TAG" \
+                -p "${REPO_NAME}.db.tar.gz" \
+                -p "${REPO_NAME}.files.tar.gz" \
+                -D repo --clobber
+            fi
+          fi
 
           # Script yang jalan sebagai root di container: siapkan user non-root.
           cat > .build.sh <<'ROOT_SCRIPT'
@@ -119,17 +150,22 @@ jobs:
           # supaya hasil build bisa dibaca/di-upload dari host.
           cat > .build-user.sh <<'USER_SCRIPT'
           set -euo pipefail
-          cd /work
 
-          # --nodeps: dependency runtime tidak perlu terpasang saat build,
-          # karena paket ini hanya membongkar biner .deb yang sudah jadi.
-          makepkg --noconfirm --clean --nodeps
+          while IFS='|' read -r dir pkgname version; do
+            [[ -z "$dir" ]] && continue
+            echo "=== Building ${pkgname} (${version}) di ${dir} ==="
+            cd "/work/${dir}"
 
-          mkdir -p repo
-          mv ./*.pkg.tar.zst repo/
-          cd repo
+            # --nodeps: dependency runtime tidak perlu terpasang saat build,
+            # karena paket ini hanya membongkar biner .deb yang sudah jadi.
+            makepkg --noconfirm --clean --nodeps
+            rm -f ./*.deb
+            mv ./*.pkg.tar.zst /work/repo/
+          done < /work/.build_targets
 
-          # Membuat <repo>.db.tar.gz dan <repo>.files.tar.gz sekaligus
+          cd /work/repo
+
+          # Tambahkan/perbarui hanya paket yang baru di-build ke database repo.
           repo-add "$REPO_NAME.db.tar.gz" ./*.pkg.tar.zst
 
           # GitHub Releases tidak menyimpan symlink. Timpa symlink .db dan
@@ -157,24 +193,23 @@ jobs:
             archlinux:base-devel \
             bash /work/.build.sh
 
-          sudo chown -R "$(id -u):$(id -g)" dist repo 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" dist repo packages 2>/dev/null || true
           ls -l dist
 
       - name: Commit PKGBUILD ke branch main
         if: steps.check.outputs.changed == 'true'
-        env:
-          VERSION: ${{ steps.check.outputs.version }}
         run: |
           set -euo pipefail
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add PKGBUILD
+          git add packages/*/PKGBUILD
 
           if git diff --cached --quiet; then
             echo 'PKGBUILD tidak berubah, tidak ada commit.'
           else
-            git commit -m "chore: bump openmausbot-bin to ${VERSION}"
+            summary=$(awk -F'|' '{printf "%s%s %s", (NR>1?", ":""), $2, $3}' .build_targets)
+            git commit -m "chore: update ${summary}"
             git push origin HEAD:main
           fi
 
@@ -192,16 +227,20 @@ jobs:
               --notes "Database dan paket pacman untuk ${REPO_NAME}. Tag ini sengaja tetap agar URL di pacman.conf tidak berubah."
           fi
 
-          # Nama paket mengandung versi, jadi asset lama tidak akan tertimpa
-          # oleh --clobber. Hapus dulu paket versi lama dari release ini.
-          old_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' \
-            | grep -E '\.pkg\.tar\.zst$' || true)
-          if [[ -n "$old_assets" ]]; then
-            while IFS= read -r asset; do
-              echo "Menghapus asset lama: ${asset}"
-              gh release delete-asset "$RELEASE_TAG" "$asset" -y
-            done <<< "$old_assets"
-          fi
+          # Hapus hanya asset .pkg.tar.zst lama milik paket yang ikut di-rebuild.
+          # Paket lain yang tidak berubah tetap dibiarkan di release.
+          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          while IFS='|' read -r dir pkgname version; do
+            [[ -z "$pkgname" ]] && continue
+            old_assets=$(printf '%s\n' "$existing_assets" \
+              | grep -E "^${pkgname}-[0-9].*\.pkg\.tar\.zst$" || true)
+            if [[ -n "$old_assets" ]]; then
+              while IFS= read -r asset; do
+                echo "Menghapus asset lama: ${asset}"
+                gh release delete-asset "$RELEASE_TAG" "$asset" -y
+              done <<< "$old_assets"
+            fi
+          done < .build_targets
 
           # Nama database (.db, .files, .tar.gz) sama setiap build -> ditimpa.
           gh release upload "$RELEASE_TAG" \
