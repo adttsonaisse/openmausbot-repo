@@ -37,9 +37,12 @@ jobs:
 
           release_assets=""
           db_entries=""
-          if release_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
-            if printf '%s\n' "$release_assets" | grep -qx "${REPO_NAME}.db.tar.gz"; then
-              gh release download "$RELEASE_TAG" -p "${REPO_NAME}.db.tar.gz" -D existing-db --clobber
+          if assets_json=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets 2>/dev/null); then
+            release_assets=$(jq -r '.assets[].name' <<< "$assets_json")
+            db_url=$(jq -r --arg n "${REPO_NAME}.db.tar.gz" '.assets[] | select(.name == $n) | .url // empty' <<< "$assets_json")
+            if [[ -n "$db_url" ]]; then
+              echo "Mengunduh ${REPO_NAME}.db.tar.gz untuk verifikasi entri..."
+              curl -fsSL --retry 3 -o "existing-db/${REPO_NAME}.db.tar.gz" "$db_url"
               db_entries=$(tar -tzf "existing-db/${REPO_NAME}.db.tar.gz")
             fi
           fi
@@ -125,14 +128,13 @@ jobs:
 
           # Ambil database repo yang sudah ada supaya paket yang tidak di-rebuild
           # tetap ada di .db dan .files.
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
-            if printf '%s\n' "$assets" | grep -qx "${REPO_NAME}.db.tar.gz" \
-               && printf '%s\n' "$assets" | grep -qx "${REPO_NAME}.files.tar.gz"; then
-              gh release download "$RELEASE_TAG" \
-                -p "${REPO_NAME}.db.tar.gz" \
-                -p "${REPO_NAME}.files.tar.gz" \
-                -D repo --clobber
+          if assets_json=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets 2>/dev/null); then
+            db_url=$(jq -r --arg n "${REPO_NAME}.db.tar.gz" '.assets[] | select(.name == $n) | .url // empty' <<< "$assets_json")
+            files_url=$(jq -r --arg n "${REPO_NAME}.files.tar.gz" '.assets[] | select(.name == $n) | .url // empty' <<< "$assets_json")
+            if [[ -n "$db_url" && -n "$files_url" ]]; then
+              echo "Mengunduh database repo yang sudah ada..."
+              curl -fsSL --retry 3 -o "repo/${REPO_NAME}.db.tar.gz" "$db_url"
+              curl -fsSL --retry 3 -o "repo/${REPO_NAME}.files.tar.gz" "$files_url"
             fi
           fi
 
@@ -220,8 +222,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if ! gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
+              -R "$GITHUB_REPOSITORY" \
               --title "$RELEASE_TAG" \
               --target main \
               --notes "Database dan paket pacman untuk ${REPO_NAME}. Tag ini sengaja tetap agar URL di pacman.conf tidak berubah."
@@ -229,7 +232,7 @@ jobs:
 
           # Hapus hanya asset .pkg.tar.zst lama milik paket yang ikut di-rebuild.
           # Paket lain yang tidak berubah tetap dibiarkan di release.
-          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          existing_assets=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           while IFS='|' read -r dir pkgname version; do
             [[ -z "$pkgname" ]] && continue
             old_assets=$(printf '%s\n' "$existing_assets" \
@@ -237,13 +240,14 @@ jobs:
             if [[ -n "$old_assets" ]]; then
               while IFS= read -r asset; do
                 echo "Menghapus asset lama: ${asset}"
-                gh release delete-asset "$RELEASE_TAG" "$asset" -y
+                gh release delete-asset "$RELEASE_TAG" "$asset" -R "$GITHUB_REPOSITORY" -y
               done <<< "$old_assets"
             fi
           done < .build_targets
 
           # Nama database (.db, .files, .tar.gz) sama setiap build -> ditimpa.
           gh release upload "$RELEASE_TAG" \
+            -R "$GITHUB_REPOSITORY" \
             dist/*.pkg.tar.zst \
             "dist/${REPO_NAME}.db" \
             "dist/${REPO_NAME}.db.tar.gz" \
