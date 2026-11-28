@@ -2,7 +2,7 @@
 # Repack dari .deb upstream. Tidak memakai debtap dan tidak build dari source.
 
 pkgname=openmausbot-bin
-pkgver=0.1.184
+pkgver=0.1.186
 pkgrel=1
 pkgdesc='A local-first chat app for running a team of AI agents (repack dari .deb resmi)'
 arch=('x86_64')
@@ -20,8 +20,8 @@ depends=(
 )
 options=('!strip' '!debug')
 noextract=("OpenMausBot-${pkgver}-amd64.deb")
-source=("OpenMausBot-0.1.184-amd64.deb::https://github.com/milind-soni/OpenMausBot/releases/download/v0.1.184/OpenMausBot-0.1.184-amd64.deb")
-sha256sums=('b48500f25cce0b52bd82e8fd32e05d20d0c520c7a0d8030dac534a0f6578bf69')
+source=("OpenMausBot-0.1.186-amd64.deb::https://github.com/milind-soni/OpenMausBot/releases/download/v0.1.186/OpenMausBot-0.1.186-amd64.deb")
+sha256sums=('d534f188b1d12ff44ac4891eb5aca1aa5321464d8ccf559093a3bd37522024bd')
 
 _deb="OpenMausBot-${pkgver}-amd64.deb"
 
